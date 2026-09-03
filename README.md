@@ -1,6 +1,6 @@
 # udc_tracker
 
-**udc_tracker** = **u**rinebag_**d**octor_**c**aregiver tracker.
+A Urine Bag-Doctor-Caregiver Tracker.
 
 A fine-tuned Grounding DINO (Swin-B) model plus a video tracking pipeline that,
 from a single hospital-room camera feed, does two jobs at once:
