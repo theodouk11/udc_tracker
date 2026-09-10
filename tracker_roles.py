@@ -327,55 +327,60 @@ def stable_urine_label(t):
     return t.locked_label
 
 
-def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
-    cap = cv2.VideoCapture(in_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+class StreamTracker:
+    """Per-connection (or per-video) stateful wrapper around the joint tracker.
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+    process_frame() takes one BGR frame and returns a JSON-serializable dict
+    of what should be displayed this frame (urine-bag states, person/role
+    boxes, badge/coat boxes) - it owns exactly the state a single
+    run_tracker_on_video() call used to build fresh per video (5 ByteTracker
+    instances, the bond/stale/role-lock dicts), so a live WebSocket
+    connection can get its own isolated instance the same way a batch video
+    does. Both run_tracker_on_video (below, renders to a video file) and the
+    live streaming path call this same method, so tracking behavior can't
+    drift between the two entry points - only what's done with the result
+    (draw to a frame vs. send as JSON) differs.
+    """
 
-    # urine-bag pipeline: one class-agnostic tracker, exactly as tracker_inference.py
-    urine_tracker = ByteTracker()
-    urine_class_hits = {c: 0 for c in URINE_TARGET_CLASSES}
+    def __init__(self, model, score_thr, low_thr):
+        self.model = model
+        self.score_thr = score_thr
+        self.low_thr = low_thr
 
-    # role pipeline: three independent, class-specific trackers - never touch
-    # or get touched by urine_tracker
-    person_tracker = ByteTracker()
-    badge_tracker = ByteTracker()
-    coat_tracker = ByteTracker()
-    role_seen = {}
+        # urine-bag pipeline: one class-agnostic tracker, exactly as tracker_inference.py
+        self.urine_tracker = ByteTracker()
+        self.urine_class_hits = {c: 0 for c in URINE_TARGET_CLASSES}
 
-    # bed anchor (v4): its own tracker, never drawn, only used to gate which
-    # urine-bag tracks are allowed to display
-    bed_tracker = ByteTracker()
-    bag_bed_bond = {}    # urine_track_id -> bed_track_id, persists while both alive
-    bag_bed_stale = {}   # urine_track_id -> consecutive frames below BED_ATTACH_THR
+        # role pipeline: three independent, class-specific trackers - never touch
+        # or get touched by urine_tracker
+        self.person_tracker = ByteTracker()
+        self.badge_tracker = ByteTracker()
+        self.coat_tracker = ByteTracker()
+        self.role_seen = {}
 
-    # sticky cross-frame state for the role pipeline (all keyed by track id,
-    # never stored as Track attributes, so it survives an appearance re-ID
-    # revival that recreates the underlying Track object under the same id)
-    badge_bond = {}     # badge_track_id -> person_track_id, persists while both alive
-    coat_bond = {}       # coat_track_id -> person_track_id, persists while both alive
-    badge_stale = {}     # badge_track_id -> consecutive frames below CONTAINMENT_THR (decay-release)
-    coat_stale = {}       # coat_track_id -> consecutive frames below CONTAINMENT_THR (decay-release)
-    role_streak = {}     # person_id -> (role, consecutive_frame_count) while still unlocked
-    locked_role = {}     # person_id -> permanently locked role, once confirmed
+        # bed anchor (v4): its own tracker, never drawn, only used to gate which
+        # urine-bag tracks are allowed to display
+        self.bed_tracker = ByteTracker()
+        self.bag_bed_bond = {}    # urine_track_id -> bed_track_id, persists while both alive
+        self.bag_bed_stale = {}   # urine_track_id -> consecutive frames below BED_ATTACH_THR
 
-    def display_role(pt):
-        return locked_role.get(pt.id) or get_role(pt)
+        # sticky cross-frame state for the role pipeline (all keyed by track id,
+        # never stored as Track attributes, so it survives an appearance re-ID
+        # revival that recreates the underlying Track object under the same id)
+        self.badge_bond = {}     # badge_track_id -> person_track_id, persists while both alive
+        self.coat_bond = {}       # coat_track_id -> person_track_id, persists while both alive
+        self.badge_stale = {}     # badge_track_id -> consecutive frames below CONTAINMENT_THR (decay-release)
+        self.coat_stale = {}       # coat_track_id -> consecutive frames below CONTAINMENT_THR (decay-release)
+        self.role_streak = {}     # person_id -> (role, consecutive_frame_count) while still unlocked
+        self.locked_role = {}     # person_id -> permanently locked role, once confirmed
 
-    frame_idx = 0
-    t0 = time.time()
+        self.frame_idx = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    def _display_role(self, pt):
+        return self.locked_role.get(pt.id) or get_role(pt)
 
-        result = inference_detector(model, frame, text_prompt=CLASS_NAMES, custom_entities=True)
+    def process_frame(self, frame):
+        result = inference_detector(self.model, frame, text_prompt=CLASS_NAMES, custom_entities=True)
         pred = result.pred_instances
         bboxes = pred.bboxes.cpu().numpy()
         scores = pred.scores.cpu().numpy()
@@ -386,8 +391,8 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
         distractor_boxes = bboxes[distractor_mask]
 
         urine_target_mask = labels < URINE_TARGET_END
-        urine_high_mask = urine_target_mask & (scores >= score_thr)
-        urine_low_mask = urine_target_mask & (scores >= low_thr) & (scores < score_thr)
+        urine_high_mask = urine_target_mask & (scores >= self.score_thr)
+        urine_low_mask = urine_target_mask & (scores >= self.low_thr) & (scores < self.score_thr)
 
         def not_vetoed(i):
             return not any(boxes_near(db, bboxes[i], VETO_MARGIN) for db in distractor_boxes)
@@ -396,21 +401,21 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
                             for i in np.where(urine_high_mask)[0] if not_vetoed(i)]
         urine_low_dets = [(bboxes[i], CLASS_NAMES[labels[i]], scores[i])
                            for i in np.where(urine_low_mask)[0] if not_vetoed(i)]
-        urine_tracker.step(frame, urine_high_dets, urine_low_dets)
+        self.urine_tracker.step(frame, urine_high_dets, urine_low_dets)
 
         # --- bed anchor (v4): tracked but never drawn, gates urine-bag display below ---
         bed_mask = labels >= STAFF_END
-        bed_dets_raw = [(bboxes[i], "bed", scores[i]) for i in np.where(bed_mask)[0] if scores[i] >= low_thr]
+        bed_dets_raw = [(bboxes[i], "bed", scores[i]) for i in np.where(bed_mask)[0] if scores[i] >= self.low_thr]
         bed_dets_nms = class_nms(bed_dets_raw, NMS_IOU_THR, NMS_CONTAINMENT_THR)
-        bed_high = [d for d in bed_dets_nms if d[2] >= score_thr]
-        bed_low = [d for d in bed_dets_nms if d[2] < score_thr]
-        bed_tracker.step(frame, bed_high, bed_low)
+        bed_high = [d for d in bed_dets_nms if d[2] >= self.score_thr]
+        bed_low = [d for d in bed_dets_nms if d[2] < self.score_thr]
+        self.bed_tracker.step(frame, bed_high, bed_low)
 
         # --- role pipeline: person / badge / white coat, fully separate ---
         staff_mask = (labels >= URINE_DISTRACTOR_END) & (labels < STAFF_END)
         by_class_raw = {c: [] for c in STAFF_CLASSES}
         for i in np.where(staff_mask)[0]:
-            if scores[i] < low_thr:
+            if scores[i] < self.low_thr:
                 continue
             cls_name = CLASS_NAMES[labels[i]]
             by_class_raw[cls_name].append((bboxes[i], cls_name, scores[i]))
@@ -418,25 +423,25 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
         by_class = {c: {"high": [], "low": []} for c in STAFF_CLASSES}
         for c in STAFF_CLASSES:
             for bbox, cls_name, score in class_nms(by_class_raw[c], NMS_IOU_THR, NMS_CONTAINMENT_THR):
-                bucket = "high" if score >= score_thr else "low"
+                bucket = "high" if score >= self.score_thr else "low"
                 by_class[c][bucket].append((bbox, cls_name, score))
 
-        person_tracker.step(frame, by_class["person"]["high"], by_class["person"]["low"])
-        badge_tracker.step(frame, by_class["badge"]["high"], by_class["badge"]["low"])
-        coat_tracker.step(frame, by_class["white coat"]["high"], by_class["white coat"]["low"])
+        self.person_tracker.step(frame, by_class["person"]["high"], by_class["person"]["low"])
+        self.badge_tracker.step(frame, by_class["badge"]["high"], by_class["badge"]["low"])
+        self.coat_tracker.step(frame, by_class["white coat"]["high"], by_class["white coat"]["low"])
 
-        person_tracks = [t for t in person_tracker.tracks if t.is_displayable()]
-        badge_tracks = [t for t in badge_tracker.tracks if t.is_displayable()]
-        coat_tracks = [t for t in coat_tracker.tracks if t.is_displayable()]
+        person_tracks = [t for t in self.person_tracker.tracks if t.is_displayable()]
+        badge_tracks = [t for t in self.badge_tracker.tracks if t.is_displayable()]
+        coat_tracks = [t for t in self.coat_tracker.tracks if t.is_displayable()]
 
         # a person whose role is already permanently locked has no more use for
         # coat/badge evidence - excluding them here stops them ever taking (or
         # continuing to hold) a bond that a still-unresolved person needs. This
         # also makes assign_sticky's own stale-bond cleanup release anything
         # they were already holding (they're simply absent from person_by_id).
-        competing_person_tracks = [pt for pt in person_tracks if pt.id not in locked_role]
-        badge_assignment = assign_sticky(badge_tracks, competing_person_tracks, CONTAINMENT_THR, badge_bond, badge_stale)
-        coat_assignment = assign_sticky(coat_tracks, competing_person_tracks, CONTAINMENT_THR, coat_bond, coat_stale)
+        competing_person_tracks = [pt for pt in person_tracks if pt.id not in self.locked_role]
+        badge_assignment = assign_sticky(badge_tracks, competing_person_tracks, CONTAINMENT_THR, self.badge_bond, self.badge_stale)
+        coat_assignment = assign_sticky(coat_tracks, competing_person_tracks, CONTAINMENT_THR, self.coat_bond, self.coat_stale)
         assigned_ids_badge = set(badge_assignment.values())
         assigned_ids_coat = set(coat_assignment.values())
         coat_box_by_id = {t.id: t.last_bbox for t in coat_tracks}
@@ -467,46 +472,45 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
             if extent_veto:
                 pt.shirt_flagged = True
 
-            if pt.id not in locked_role:
+            if pt.id not in self.locked_role:
                 current = get_role(pt)
                 if current == "Person":
-                    role_streak[pt.id] = None
+                    self.role_streak[pt.id] = None
                 else:
-                    prev = role_streak.get(pt.id)
+                    prev = self.role_streak.get(pt.id)
                     streak = prev[1] + 1 if prev is not None and prev[0] == current else 1
-                    role_streak[pt.id] = (current, streak)
+                    self.role_streak[pt.id] = (current, streak)
                     if streak >= ROLE_CONFIRM_FRAMES:
-                        locked_role[pt.id] = current
+                        self.locked_role[pt.id] = current
 
-            role_seen.setdefault(pt.id, set()).add(display_role(pt))
+            self.role_seen.setdefault(pt.id, set()).add(self._display_role(pt))
 
         # --- bed-anchor gate (v4): which urine-bag tracks are even allowed to display ---
-        displayable_bed_tracks = [t for t in bed_tracker.tracks if bed_track_ok(t)]
+        displayable_bed_tracks = [t for t in self.bed_tracker.tracks if bed_track_ok(t)]
         bed_present = len(displayable_bed_tracks) > 0
-        urine_displayable = [t for t in urine_tracker.tracks if t.is_displayable()]
+        urine_displayable = [t for t in self.urine_tracker.tracks if t.is_displayable()]
         bag_bed_assignment = assign_sticky(urine_displayable, displayable_bed_tracks, BED_ATTACH_THR,
-                                            bag_bed_bond, bag_bed_stale, margin=BED_ATTACH_MARGIN)
+                                            self.bag_bed_bond, self.bag_bed_stale, margin=BED_ATTACH_MARGIN)
         attached_bag_ids = set(bag_bed_assignment.keys())
 
-        # --- draw both pipelines onto the same frame ---
+        # --- what gets displayed this frame, as data (both entry points share this) ---
+        urine_bags = []
         for t in urine_displayable:
             if not bed_present or t.id not in attached_bag_ids:
                 continue  # no bed tracked this frame, or not the bag attached to it - false positive
             label = stable_urine_label(t)
-            color = URINE_PALETTE[label]
-            x1, y1, x2, y2 = t.last_bbox.astype(int)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            tag = " [rec]" if t.recovered_last else ""
-            text = f"#{t.id} {label}: {t.last_score:.2f}{tag}"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 10)), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, text, (x1 + 3, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            urine_class_hits[label] += 1
+            self.urine_class_hits[label] += 1
+            urine_bags.append({
+                "track_id": t.id,
+                "label": label,
+                "score": float(t.last_score),
+                "bbox": t.last_bbox.tolist(),
+                "recovered": bool(t.recovered_last),
+            })
 
-        for t in badge_tracks:
-            x1, y1, x2, y2 = [int(v) for v in t.last_bbox]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), ROLE_PALETTE["badge"], 1)
+        badges = [{"track_id": t.id, "bbox": t.last_bbox.tolist()} for t in badge_tracks]
+
+        coats = []
         for t in coat_tracks:
             owner, best_c = None, 0.0
             for pt in person_tracks:
@@ -515,32 +519,88 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
                     owner, best_c = pt, c
             if owner is not None and best_c >= CONTAINMENT_THR and owner.shirt_flagged:
                 continue
-            x1, y1, x2, y2 = [int(v) for v in t.last_bbox]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), ROLE_PALETTE["white coat"], 1)
-        for t in person_tracks:
-            role = display_role(t)
-            color = ROLE_PALETTE[role]
-            x1, y1, x2, y2 = [int(v) for v in t.last_bbox]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            text = f"#{t.id} {role}"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 10)), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, text, (x1 + 3, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            coats.append({"track_id": t.id, "bbox": t.last_bbox.tolist()})
 
+        people = [
+            {"track_id": t.id, "role": self._display_role(t), "bbox": t.last_bbox.tolist()}
+            for t in person_tracks
+        ]
+
+        self.frame_idx += 1
+        return {
+            "frame_index": self.frame_idx,
+            "urine_bags": urine_bags,
+            "people": people,
+            "badges": badges,
+            "coats": coats,
+        }
+
+
+def _draw_frame_result(frame, result):
+    """Renders a StreamTracker.process_frame() result onto frame in place -
+    the batch path's only remaining video-specific step."""
+    for b in result["urine_bags"]:
+        color = URINE_PALETTE[b["label"]]
+        x1, y1, x2, y2 = (int(v) for v in b["bbox"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        tag = " [rec]" if b["recovered"] else ""
+        text = f"#{b['track_id']} {b['label']}: {b['score']:.2f}{tag}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(frame, (x1, max(0, y1 - th - 10)), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, text, (x1 + 3, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    for b in result["badges"]:
+        x1, y1, x2, y2 = (int(v) for v in b["bbox"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), ROLE_PALETTE["badge"], 1)
+
+    for c in result["coats"]:
+        x1, y1, x2, y2 = (int(v) for v in c["bbox"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), ROLE_PALETTE["white coat"], 1)
+
+    for p in result["people"]:
+        color = ROLE_PALETTE[p["role"]]
+        x1, y1, x2, y2 = (int(v) for v in p["bbox"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        text = f"#{p['track_id']} {p['role']}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.rectangle(frame, (x1, max(0, y1 - th - 10)), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, text, (x1 + 3, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
+    cap = cv2.VideoCapture(in_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+    tracker = StreamTracker(model, score_thr, low_thr)
+    t0 = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_result = tracker.process_frame(frame)
+        _draw_frame_result(frame, frame_result)
         writer.write(frame)
-        frame_idx += 1
 
-        if frame_idx % 50 == 0 or frame_idx == n_frames:
+        if tracker.frame_idx % 50 == 0 or tracker.frame_idx == n_frames:
             elapsed = time.time() - t0
-            rate = frame_idx / elapsed
-            eta = (n_frames - frame_idx) / rate if rate > 0 else 0
-            print(f"  [{os.path.basename(in_path)}] frame {frame_idx}/{n_frames} "
+            rate = tracker.frame_idx / elapsed
+            eta = (n_frames - tracker.frame_idx) / rate if rate > 0 else 0
+            print(f"  [{os.path.basename(in_path)}] frame {tracker.frame_idx}/{n_frames} "
                   f"({rate:.1f} fps, ETA {eta:.0f}s)", flush=True)
 
     cap.release()
     writer.release()
-    return frame_idx, urine_class_hits, role_seen, locked_role
+    return tracker.frame_idx, tracker.urine_class_hits, tracker.role_seen, tracker.locked_role
 
 
 @contextlib.contextmanager
