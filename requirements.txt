@@ -11,3 +11,7 @@ scipy==1.15.3
 # Language branch (GroundingDINO/GLIP text encoder and parser)
 transformers==4.57.1
 sentencepiece==0.2.0
+
+# Needed by the encoder's gradient-checkpoint layers (num_cp>0 in the config) even
+# at inference time — not pulled in automatically by mmdet/mmcv.
+fairscale

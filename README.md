@@ -104,6 +104,19 @@ mim install mmdet
 pip install -r requirements.txt
 ```
 
+**Known environment gotchas:**
+- `mmcv==2.1.0` has no prebuilt wheel for every Torch/CUDA combination (e.g.
+  Torch 2.6.0 + CUDA 12.4) — if `mim install "mmcv==2.1.0"` falls back to a
+  source build, that's expected, not a broken install; it just takes a while
+  (~15 min).
+- PyTorch >=2.6 defaults `torch.load(weights_only=True)`, which will refuse to
+  load this checkpoint (it isn't pure tensors). `tracker_roles.py` already
+  works around this itself (a `torch.load` override scoped to just the one
+  `init_detector(...)` call that loads your own trusted `weights/model.pth`)
+  — if you call `init_detector` from your own script instead, you'll need the
+  same narrow workaround, not a blanket `weights_only=False` for the whole
+  process.
+
 **Deterministic-training patch (only needed if you plan to retrain, not for
 inference):** the training config sets `deterministic=True`, which requires
 patching MMEngine to accept a `warn_only` flag — see

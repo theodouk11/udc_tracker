@@ -25,12 +25,14 @@ project's private design notes, not in this file.
 """
 
 import argparse
+import contextlib
 import os
 import time
 from collections import Counter, deque
 
 import cv2
 import numpy as np
+import torch
 from scipy.optimize import linear_sum_assignment
 
 from mmdet.apis import init_detector, inference_detector
@@ -541,6 +543,21 @@ def run_tracker_on_video(model, in_path, out_path, score_thr, low_thr):
     return frame_idx, urine_class_hits, role_seen, locked_role
 
 
+@contextlib.contextmanager
+def _trusted_checkpoint_load():
+    """PyTorch >=2.6 defaults torch.load(weights_only=True), which rejects this
+    checkpoint (it isn't pure tensors). Scoped to exactly the one init_detector()
+    call below that loads our own trusted weights/model.pth - never apply
+    weights_only=False more broadly than that, since it re-enables arbitrary code
+    execution on whatever gets loaded."""
+    original = torch.load
+    torch.load = lambda *a, **kw: original(*a, **{**kw, "weights_only": False})
+    try:
+        yield
+    finally:
+        torch.load = original
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -555,7 +572,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print(f"Loading model from {args.checkpoint} ...", flush=True)
-    model = init_detector(args.config, args.checkpoint, device=args.device)
+    with _trusted_checkpoint_load():
+        model = init_detector(args.config, args.checkpoint, device=args.device)
 
     videos = sorted(f for f in os.listdir(args.video_dir) if f.lower().endswith(".mp4"))
     print(f"Found {len(videos)} videos: {videos}", flush=True)
