@@ -143,4 +143,15 @@ exps_*
 # kept locally for reference / re-running training, not published
 README_urinebag.md
 README_task5.md
+README_api_project.md
+report_api_formal.md
+guide_api_plain.md
 job_urinebag_joint_bluefix.sh
+
+# fruits (apple/tomato) task: keep the investigation notes and experiment
+# working dir local, same convention as above; the config + README section
+# are what's published
+README_fruits.md
+job_fruits_apple_tomato.sh
+exp_fruits_results/
+slurm-*.out

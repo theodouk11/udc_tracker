@@ -320,6 +320,54 @@ send a second frame before the previous one has been answered.
 
 ---
 
+## Also in this repo: an apple/tomato detector
+
+A separate model, not part of the urine-bag/staff-role tracker above: a standalone 2-class photo
+detector (`apple`, `tomato`), no video or tracking component.
+
+Config: `configs_custom/grounding_dino_swin-b_finetune_fruits.py`, fine-tuned from the same
+[MM-Grounding-DINO Swin-B](https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-b_pretrain_all/grounding_dino_swin-b_pretrain_all-f9818a7c.pth)
+pretrained checkpoint. Test set results: **mAP 0.965, mAP@50 0.997** (apple 0.975/1.000, tomato
+0.956/0.995).
+
+**Download the weights** (`model_fruits.pth`, ~900MB). It isn't stored in this git repo. Grab it
+from [Releases](../../releases) instead:
+
+```bash
+mkdir -p weights
+curl -L -o weights/model_fruits.pth \
+  https://github.com/theodouk11/udc_tracker/releases/download/fruits-v1.0/model_fruits-f262d3c6.pth
+```
+
+**Inference** (same `mmdet.apis` pattern used by `tracker_roles.py`, just without any tracking):
+
+```python
+from mmdet.apis import init_detector, inference_detector
+
+model = init_detector(
+    'configs_custom/grounding_dino_swin-b_finetune_fruits.py',
+    'weights/model_fruits.pth', device='cuda:0')
+result = inference_detector(model, 'your_image.jpg', text_prompt=['apple', 'tomato'], custom_entities=True)
+```
+
+**Retraining**, same pattern as the urine-bag model above, just with the fruits config:
+
+```bash
+CONFIG="configs_custom/grounding_dino_swin-b_finetune_fruits.py"
+./tools/dist_train.sh "$CONFIG" 1 9994 0 --work-dir /path/to/results
+./tools/dist_test.sh "$CONFIG" /path/to/results/best_coco_bbox_mAP_iter_*.pth 1 9994 0 \
+  --work-dir /path/to/results --out /path/to/results/test.pkl
+
+python tools/model_converters/publish_model.py \
+  /path/to/results/best_coco_bbox_mAP_iter_*.pth weights/model_fruits.pth
+```
+
+Requires `FRUITS_DATASET_PATH` set in `src_path.py` (only needed to retrain, not for inference
+with the released checkpoint): a COCO-format dataset with `images/{train,val,test}/` and
+`instances_{train,val,test}.json` at its root.
+
+---
+
 ## License
 
 Apache-2.0: see [LICENSE](./LICENSE). Derivative of Intellindust-AI-Lab/FT-FSOD;
